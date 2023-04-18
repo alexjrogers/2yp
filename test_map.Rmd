@@ -1,0 +1,528 @@
+---
+
+
+output: html_document
+always_allow_html: true
+
+---
+
+
+```{r include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(tidycensus)
+library(tidygeocoder)
+library(tigris)
+library(sf)
+library(mapview)
+library(tmap)
+library(purrr)
+library(png)
+library(knitr)
+library(modelsummary)
+library(corrr)
+library(tinytex)
+library(janitor)
+knit_hooks$set(crop = knitr::hook_pdfcrop)
+options(tigris_use_cache = TRUE)
+```
+
+```{r Fatal Encounters setup, include=FALSE}
+
+# Preparing the Fatal Encounters data
+
+## loading raw data into R
+d <- read.csv("FE.csv")
+
+## first removing placeholder row from FE, 
+## next selecting interesting variables
+d <- d %>% subset(Location.of.injury..address. != "This row is a spacer for Fatal Encounters use.") %>% 
+select(
+  Unique.ID,
+  Age,
+  Gender,
+  Race,
+  Race.with.imputations,
+  Location.of.injury..address.,  
+  Location.of.death..city.,
+  State,
+  Location.of.death..zip.code.,
+  Location.of.death..county.,
+  Full.Address,
+  Latitude,
+  Longitude,
+  Agency.or.agencies.involved,
+  Highest.level.of.force,
+  Date.of.injury.resulting.in.death..month.day.year.,
+  Intended.use.of.force..Developing.)
+
+## converting from character string to date
+d <- d %>% mutate(Date =  
+                    mdy(Date.of.injury.resulting.in.death..month.day.year.))
+
+## saving an sf object of all events. Starting with 2010 - present. Can check back, but may not need to (definitely don't need to as that's not what I'm looking for here. May be interested in the future.. Mostly want to see if I can reproduce the bad geo Kieran found.
+
+
+## saving raw FE data to compare to mapped dpoints_all to look for potentially bad coordinates
+d_all <- d
+
+d_all <- d_all %>% rename(ID = Unique.ID,
+                  Location = Location.of.injury..address.,
+                  City = Location.of.death..city.,
+                  ZipCode = Location.of.death..zip.code.,
+                  County = Location.of.death..county.,
+                  Address = Full.Address,
+                  Agency = Agency.or.agencies.involved,
+                  ForceType = Highest.level.of.force,
+                  ForceIntent = Intended.use.of.force..Developing.,
+                  RaceImputed = Race.with.imputations) %>% mutate(Date =  
+                    mdy(Date.of.injury.resulting.in.death..month.day.year.)) %>% mutate(Year = year(Date))
+
+## verified in excel that Unique.ID 28891 includes a comma which is providing an NA value when converting to sf. Need to report to FE.
+dpoints_all <- d_all %>% filter(ID != "28891") %>%
+ st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83")
+
+## just checking to see if maybe Kieran didn't include CRS when converting to sf. Could also just look at what CRS he used. Maybe that's why he's seeing a rogue point that I'm not
+dpoints_all_nocrs <- d %>% filter(Unique.ID != "28891") %>%
+ st_as_sf(coords = c("Longitude", "Latitude"))
+
+
+# grabbing just FEs coded as State == "CA" so I can manually check coordinates. Again, I can check this in code as Kieran did
+d_ca <- d_all %>% filter(State == "CA")
+
+dpoints_ca <- dpoints_all %>%
+ filter(State == "CA")
+
+
+## okay so filtering on CA first this works. There's something wrong with the coordinates in some other state I think.
+
+
+
+## extracting desired years.
+d <- d %>% mutate(Year = year(Date)) %>% filter(Year >= 2010 & Year <= 2019)
+
+## renaming annoying variables
+d <- d %>% rename(ID = Unique.ID,
+                  Location = Location.of.injury..address.,
+                  City = Location.of.death..city.,
+                  ZipCode = Location.of.death..zip.code.,
+                  County = Location.of.death..county.,
+                  Address = Full.Address,
+                  Agency = Agency.or.agencies.involved,
+                  ForceType = Highest.level.of.force,
+                  ForceIntent = Intended.use.of.force..Developing.,
+                  RaceImputed = Race.with.imputations)
+
+d_10_19 <- d
+
+## filtering by officer-action related deaths
+types <- c("Gunshot", "Tasered", "Asphyxiated/Restrained", "Chemical agent/Pepper spray", "Beaten/Bludgeoned with instrument", "Restrain/Asphyxiation")
+d <- d %>% filter(ForceType == types)
+
+
+## removing events with Race unspecified for both Race and RaceImputed
+d <- d %>% filter(!is.na(RaceImputed)) %>%
+  filter(Race != "Race unspecified" & RaceImputed != "Race unspecified")
+```
+
+
+
+```{r converting FE data to root sf object, include=FALSE}
+
+## transforming df into sf object, converting coordinates to points.
+dpoints <- d %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83")
+## now I have the FE database filtered to 2010 - 2019, only for officer-caused deaths, and with each coordinate converted to a point which I can map
+
+states <- unique(dpoints$State) %>% str_sort()
+```
+
+```{r include=FALSE}
+
+## getting a list of Census variables for the redistricting file
+census_vars <- load_variables(2020, "pl")
+
+## The race variables I am interested in
+racecats <- c(Hispanic = "P2_002N", White = "P2_005N", Black = "P2_006N", Native = "P2_007N", Asian  = "P2_008N")
+
+## Getting maps and racial demographic info for all 50 states, 2020 Census
+us_states <- get_decennial(year = 2020,
+                           geography = "state",
+                           geometry = TRUE,
+                           sumfile = "pl",
+                           variables = racecats,
+                           summary_var = "P2_001N",
+                           output = "wide",
+                           keep_geo_vars = TRUE,
+                           cache_table = TRUE) %>%
+   filter(GEOID != "72") %>% 
+  mutate(pct_blk = Black / summary_value * 100,
+                                    pct_white = White / summary_value * 100,
+                                    pct_hispanic = Hispanic / summary_value * 100,
+                                    pct_asian = Asian / summary_value * 100,
+                                    pct_native = Native / summary_value * 100)%>% 
+        mutate(us_pop = sum(summary_value), us_pct = summary_value / us_pop *100) %>% 
+  mutate(maj_white = if_else(pct_white > pct_blk & pct_white > pct_hispanic & pct_white > pct_asian & pct_white > pct_native, "yes", "no"),
+         maj_blk = if_else(pct_blk > pct_white & pct_blk > pct_hispanic & pct_blk > pct_asian & pct_blk > pct_native, "yes", "no"),
+         maj_hisp = if_else(pct_hispanic > pct_white & pct_hispanic > pct_blk & pct_hispanic > pct_asian & pct_hispanic > pct_native, "yes", "no"),
+         maj_asian = if_else(pct_asian > pct_white & pct_asian > pct_blk & pct_asian > pct_hispanic & pct_asian > pct_native, "yes", "no"))
+## not creating a pct_native variable because there is no such state.
+## There is probably a better way to do this that compares the values of the pct_race variables and outputs blk, wht, hispanic, etc in a variable called "majority"
+
+
+
+## Getting maps and racial demographic info for all US counties, 2020 Census
+us_counties <- get_decennial(year = 2020,
+                             geography = "county",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             summary_var = "P2_001N",
+                             output = "wide",
+                             keep_geo_vars = TRUE,
+                             cache_table = TRUE) %>%
+  filter(STATEFP != "72") %>% 
+  mutate(pct_blk = Black / summary_value * 100,
+                                    pct_white = White / summary_value * 100,
+                                    pct_hispanic = Hispanic / summary_value * 100,
+                                    pct_asian = Asian / summary_value * 100,
+                                    pct_native = Native / summary_value * 100) %>% 
+  mutate(us_pop = sum(summary_value), us_pct = summary_value / us_pop *100) %>% 
+  mutate(maj_white = if_else(pct_white > pct_blk & pct_white > pct_hispanic & pct_white > pct_asian & pct_white > pct_native, "yes", "no"),
+         maj_blk = if_else(pct_blk > pct_white & pct_blk > pct_hispanic & pct_blk > pct_asian & pct_blk > pct_native, "yes", "no"),
+         maj_hisp = if_else(pct_hispanic > pct_white & pct_hispanic > pct_blk & pct_hispanic > pct_asian & pct_hispanic > pct_native, "yes", "no"),
+         maj_asian = if_else(pct_asian > pct_white & pct_asian > pct_blk & pct_asian > pct_hispanic & pct_asian > pct_native, "yes", "no"),
+         maj_native = if_else(pct_native > pct_white & pct_native > pct_blk & pct_native > pct_hispanic & pct_native > pct_asian, "yes", "no"))
+
+
+```
+
+
+```{r include=FALSE}
+
+## this new df now has the coordinates updated 
+
+## creating a new df to quickly compare fixed coordinates to original d
+## I'm removing that paste and grepl code I used to filter on the bad_ids character string
+
+
+## grouping events by state
+dpoints_geocheck <- dpoints %>% group_by(State)
+
+## creating a list (group of dfs?) separated by State from dpoints
+dpoints_split <- split(distinct(dpoints_geocheck), dpoints_geocheck$State)
+
+
+## trying to extract or filter on individual dfs in list
+split_ak <- distinct(dpoints_split$AK)
+## okay, so just as an example, this grabs only AK and creates a df from it. Better than filtering each unique state I think. I think this list will be helpful. So I could relatively quickly manually pull all states, but I bet I could get this to do what I want automatically.
+
+## trying to filter us_states by AK state variable in dpoints
+test_ak <- us_states %>% filter(STUSPS == unique(split_ak$State))
+
+## trying to join the Census data I filtered by the split_ak test extract
+test_ak_pip <- st_join(split_ak, test_ak, st_within)
+
+
+## thinking here, at the split_ak level, line 929, that is where I should be able to automate, I can run something to split each state and create a dataframe, since I will need that anyway. The other thing is maybe I can just filter the list and link each separate state frame to the appropriate state data in us_states
+
+## It may not be exactly what I want, but I think a next step for understanding how this will work is to see if I can split each of the dataframes in dpoints_split to be saved as their own dataframe. As I am writing this again I'm circling back to they are already there in a list and it is probably redundant to split them out, I am tempted to just look into how to run a function for each DF in a list. Maybe I'll try to briefly look into that since that feels more clear to me than what I was trying to do the other day, but if I get stuck on that I will try the first idea, saving each df individually outside of the list.
+
+## given above, I am going to try to get map() to get something really basic to every df in the list.
+## map feeling weird, trying lapply
+
+states <- unique(dpoints$State) %>% str_sort()
+
+## this calls each individual state df: dpoints_split[states]
+
+#dpoints_split[states] %>% lapply(mean)
+## okay so this does something referring to each df. I think this needs to be in the function side of what I'm trying to do.
+
+#pls <- map2(dpoints_split[states], us_states$STUSPS)
+
+## breakthrough thought? I probably need a list of dfs, one for each state, from us_states, same as I have for dpoints?
+## grouping  by state
+us_states_geocheck <- us_states %>% group_by(STUSPS)
+
+## creating a list (group of dfs?) separated by State from us_states
+us_states_split <- split(distinct(us_states_geocheck), us_states_geocheck$STUSPS)
+
+dpoints_joined <- map2(dpoints_split[states], us_states_split, st_join)
+## my god I'm really getting there.
+## why doesn't this work after restarting R?????
+
+#dpoints_bad <- map_dfr(dpoints_joined[states], map(filter(is.na())))
+
+## going to try to make a function to filter NA for GEOID
+
+dpoints_bad_test <- map(dpoints_joined, ~filter(.x, is.na(GEOID)))
+## wait I think this is it. I think this is a list of the dfs filtered by NA on GEOID...
+
+
+## trying to filter out dataframes with no rows
+dpoints_bad <- discard(dpoints_bad_test, ~nrow(.) == 0)
+
+##okay, I've got it. I want this to be a dataframe so I can merge it onto a US map.
+## important, making this a DF means it's not an sf object anymore. I wonder if I can rbind to sf?
+## for now I'm just going to convert it back.
+bad_df <- list_rbind(dpoints_bad)
+bad_sf <- bad_df %>% st_as_sf(crs = "NAD83")
+bad_pip <- st_join(bad_sf, us_states, st_within)
+bad_check <- bad_pip %>% select(State, STUSPS.y, ID, Address, Date)
+## this created an SF object that allowed me to easily see what state FE had it linked to and what state it maps to given US maps
+
+## creating a character string with the bad states and the right ones
+bad_fe <- as.character(bad_pip$State)
+bad_census <- as.character(bad_pip$STUSPS.y)
+
+bad_checkdf <- bad_check %>% mutate(Latitude = as.numeric(c("34.048458279089864", "39.44736342302588", "38.29834550763058", "38.270123", "30.495897", "38.81350717489374", "35.072918", "32.80622231144818")), Longitude = as.numeric(c("-117.20908573968164", "-121.55137018506501", "-122.47866289823347", "-85.815479", "-90.196680", "-94.53841851515506", "-106.640037", "-96.67958371977905"))) %>% as.data.frame() %>% select(ID, Latitude, Longitude)
+
+bad_check <- bad_check %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83")
+
+
+bad_checkdf <- bad_checkdf %>% mutate(ID = as.character(ID), Latitude = as.character(Latitude))
+
+bad_ids <- bad_df$ID
+
+d <- d %>% mutate(ID = as.character(ID))
+
+d <- rows_update(d, bad_checkdf, by = c("ID"))
+## this new df now has the coordinates updated 
+
+## creating a new df to quickly compare fixed coordinates to original d
+## I'm removing that paste and grepl code I used to filter on the bad_ids character string
+
+dpoints <- d %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83")
+
+```
+
+
+```{r Creating first pip sf objects pip_states and pip_counties, include=FALSE}
+
+## creating a point-in-polygon sf object to map to the US Census data gathered above
+us_pip_states <- st_join(dpoints, us_states, st_within) %>% 
+  group_by(GEOID) %>% 
+  mutate(fe_total = n()) %>% 
+  group_by(ForceType) %>% 
+  mutate(force_count = n()) %>% 
+  ungroup()
+
+## creating pip sf object of US by county
+us_pip_counties <- st_join(dpoints, us_counties, st_within) %>% 
+  group_by(GEOID) %>% 
+  mutate(fe_total = n()) %>% 
+  group_by(ForceType) %>% 
+  mutate(force_count = n()) %>% 
+  ungroup()
+
+
+
+
+```
+
+
+```{r LA, message=FALSE, warning=FALSE, include=FALSE}
+
+## creating LA map
+la_map <- us_counties %>% filter(GEOID == "06037")
+
+## creating LA pip
+la_pip <- us_pip_counties %>% filter(GEOID == "06037") %>% 
+  group_by(GEOID) %>% 
+  mutate(fe_total = n()) %>%
+  group_by(ForceType) %>% 
+  mutate(force_count = n()) %>%
+  group_by(Race) %>%
+  mutate(race_count = n()) %>%
+  group_by(race_count) %>% 
+  mutate(race_pct = 100 * race_count / fe_total) %>% 
+  ungroup()
+
+```
+
+
+
+```{r include=FALSE}
+
+## looks like I'll need to grab CA first then filter out LA
+ca_places <- get_decennial(year = 2020,
+                           geography = "place",
+                           state = "CA",
+                           geometry = TRUE,
+                           sumfile = "pl",
+                           variables = racecats,
+                           summary_var = "P2_001N",
+                           output = "wide",
+                           keep_geo_vars = TRUE,
+                           cache_table = TRUE) %>% mutate(pct_blk = Black / summary_value * 100,
+                                    pct_white = White / summary_value * 100,
+                                    pct_hispanic = Hispanic / summary_value * 100,
+                                    pct_asian = Asian / summary_value * 100,
+                                    pct_native = Native / summary_value * 100)
+
+
+
+
+
+```
+
+```{r include=FALSE}
+## found a CSV of LA Census designated places online. Loading that and seeing if I can use that to filter what I'm pulling in TidyCensus. Could also just work as a standalone, but probably better to keep datasource consistent.
+
+la_CDP <- read.csv("LA_CDP.csv")
+
+## changing from odd object type
+la_CDP <- as.tibble(la_CDP)
+
+## filtering cities only.
+## wondering if there are FEs in CDPs that are unincorporated... I guess we'll see when I check everything
+
+la_CDP_cities <- la_CDP %>% filter(LSAD == "City")
+
+## Okay, we're at cities only. Now can I filter ca_places by matching GEOIDs? Likley will need paste + grepl
+```
+
+
+```{r include=FALSE}
+
+## Filtering ca_places by the list of GEOIDs in the la_CDP_cities df
+la_city_geoid <- as.character(la_CDP_cities$GEOID)
+la_cities <- ca_places %>% filter(grepl(paste(la_city_geoid, collapse = "|"), GEOID))
+
+## filtering ca_places by the GEOIDs in the la_CDP df
+
+la_CDP_geoid <- as.character(la_CDP$GEOID)
+la_CDP_sf <- ca_places %>% filter(grepl(paste(la_CDP_geoid, collapse = "|"), GEOID))
+
+## Okay, GEOID count between list from web and sf object are the same. good sign.
+```
+
+
+
+```{r include=FALSE}
+
+la_cities_pip <- st_join(dpoints, la_cities, st_within) %>% 
+  group_by(GEOID) %>% 
+  mutate(fe_total = n()) %>% 
+  group_by(ForceType) %>%
+  mutate(force_count = n()) %>% 
+  ungroup() %>% 
+  filter(!is.na(GEOID))
+
+```
+
+
+
+```{r include=FALSE}
+
+la_all_pip <- st_join(dpoints, la_CDP_sf, st_within) %>% 
+  group_by(GEOID) %>% 
+  mutate(fe_total = n()) %>% 
+  group_by(ForceType) %>%
+  mutate(force_count = n()) %>% 
+  ungroup() %>% 
+  filter(!is.na(GEOID))
+
+
+```
+
+
+
+```{r include=FALSE}
+
+la_all_id <- as.character(la_pip$ID)
+
+
+
+```
+
+
+
+```{r include=FALSE}
+
+all.equal(la_pip$ID, la_all_pip$ID)
+
+## cool, that was easy. grabbed from stack overflow
+la_missing <- la_pip %>% filter(!la_pip$ID %in% la_all_pip$ID)
+```
+
+
+```{r include=FALSE}
+
+la_tmp <- as.tibble(la_pip)
+la_missing_tmp <- as.tibble(la_missing)
+
+la_tmp_all <- left_join(la_tmp, la_missing)
+
+la_tmp_all <- la_tmp_all %>% st_as_sf()
+
+mapview(la_tmp_all)
+
+
+```
+
+
+```{r include=FALSE}
+
+mapview(la_CDP_sf)+
+  mapview(la_missing)
+
+
+```
+
+
+
+```{r include=FALSE}
+
+st_crs(la_CDP_sf)
+
+
+```
+
+
+
+```{r include=FALSE}
+
+st_crs(la_missing)
+
+
+```
+
+
+
+```{r include=FALSE}
+
+ca_tst1 <- st_join(ca_places, la_map, st_within) %>% filter(!is.na(GEOID.y))
+## This has the same number of places as the other sf object, maybe not helpful yet.
+
+mapview(ca_tst1)+
+  la_missing
+
+## okay yeah same thing
+
+
+```
+
+
+```{r include=FALSE}
+
+## wanna keep viewing / editing this map moving forward
+
+la_pctwhite <- mapview(la_CDP_sf, zcol = "pct_white", layer.name = 'Percent White')+
+  mapview(la_all_pip, col.regions = "black", cex = 3)
+
+## okay. Here are my events laid over the CDP they occured in. Now I want to look at demographic info.
+
+## that should already be in la_all_pip I think
+
+mapshot(la_pctwhite, "la_pctwhite.html")
+```
+
+
+
+```{r echo=FALSE}
+
+la_pctwhite
+
+
+```
+
